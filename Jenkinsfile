@@ -2,7 +2,7 @@ pipeline {
     agent {
         docker {
             image 'python:3.9-slim'
-            args '--user root'
+            args '--user root -e HOME=/root'
         }
     }
 
@@ -33,6 +33,48 @@ pipeline {
             post {
                 always {
                     junit 'test-reports/results.xml' 
+                }
+            }
+        }
+        stage('Manual Approval') {
+            // Mengecek apakah variabel GIT_BRANCH mengandung kata 'master' pada tipe job Pipeline Standar (bukan Multibranch)
+            when { 
+                expression { env.GIT_BRANCH == 'master' || env.GIT_BRANCH == 'origin/master' } 
+            }
+            steps {
+                timeout(time: 30, unit: 'MINUTES') {
+                    input message: "Lanjutkan ke tahap Deploy?"
+                }
+            }
+        }
+        stage('Deploy') {
+            when { 
+                expression { env.GIT_BRANCH == 'master' || env.GIT_BRANCH == 'origin/master' } 
+            }
+            steps {
+                unstash 'compiled-results'
+                sh '''
+                    apt-get update -qq
+                    apt-get install -y --no-install-recommends binutils
+                    . venv/bin/activate
+                    pip install pyinstaller
+                    pyinstaller --onefile sources/add2vals.py
+
+                    echo "===> Memulai aplikasi di background."
+                    # Jalankan binary hasil compile di background dan simpan Process ID (PID)
+                    ./dist/add2vals & APP_PID=$!
+
+                    echo "===> Menunggu 1 menit aplikasi berjalan."
+                    sleep 60
+
+                    echo "===> Waktu habis. Menghentikan aplikasi."
+                    # Matikan aplikasi menggunakan PID yang disimpan sebelumnya
+                    kill $APP_PID || true
+                '''
+            }
+            post {
+                success {
+                    archiveArtifacts artifacts: 'dist/add2vals', fingerprint: true
                 }
             }
         }
