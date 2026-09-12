@@ -7,7 +7,7 @@ pipeline {
     }
 
     triggers {
-        pollSCM('TZ=Asia/Jakarta \n H/2 * * * *') // Polls every 2 minutes
+        githubPush() // Listens for the GitHub Webhook push event
     }
 
     stages {
