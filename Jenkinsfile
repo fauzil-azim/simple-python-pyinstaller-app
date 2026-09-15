@@ -1,91 +1,156 @@
 pipeline {
-    agent {
-        docker {
-            image 'python:3.9-slim'
-            args '--user root -e HOME=/root'
-        }
+    // agent none is REQUIRED when mixing built-in and docker agents
+    // Any top-level docker agent causes workspace lock conflicts
+    // when a stage tries to override with built-in
+    agent none
+
+    environment {
+        PYTHONDONTWRITEBYTECODE       = '1'
+        PYTHONUNBUFFERED              = '1'
+        PIP_NO_CACHE_DIR              = '1'
+        PIP_DISABLE_PIP_VERSION_CHECK = '1'
+        APP_BINARY_NAME   = 'add2vals'
+        DEPLOYMENT_HOST   = "${env.DEPLOY_HOST}"
+        DEPLOYMENT_USER   = "${env.DEPLOY_USER}"
+        DEPLOYMENT_PORT   = "${env.DEPLOY_PORT}"
+        DEPLOYMENT_BRANCH = 'local-master'
+        SSH_CRED_ID       = 'host-deploy-key'
     }
 
     triggers {
-        githubPush() // Listens for the GitHub Webhook push event
+        pollSCM('TZ=Asia/Jakarta \n H/2 * * * *') // Polls every 2 minutes
     }
 
     stages {
-        stage('Build') {
-            steps {
-                sh 'python -m py_compile sources/add2vals.py sources/calc.py'
-                stash(name: 'compiled-results', includes: 'sources/*.py*')
+        stage('CI') {
+            agent {
+                docker {
+                    image 'python:3.9-slim-bullseye'
+                    args  '--user root -e HOME=/root'
+                }
             }
-        }
-        stage('Test') { 
-            steps {
-                // Run everything in one shell so the venv activation persists
-                sh '''
-                    python -m venv venv
-                    . venv/bin/activate
-                    pip install -r requirements.txt
+            stages {
+                stage('Build') {
+                    steps {
+                        sh 'python -m py_compile sources/add2vals.py sources/calc.py'
+                        stash(name: 'compiled-results', includes: 'sources/*.py*')
+                    }
+                }
+                stage('Test') {
+                    steps {
+                        // Run everything in one shell so the venv activation persists
+                        sh '''
+                            python -m venv venv
+                            . venv/bin/activate
+                            pip install -r requirements.txt
 
-                    # Run Pylint (continue even if score is less than 10)
-                    pylint sources/ || true
-                    pytest --junit-xml test-reports/results.xml sources/test_calc.py
-                '''
-            }
-            post {
-                always {
-                    junit 'test-reports/results.xml' 
+                            # Run Pylint (continue even if score is less than 10)
+                            pylint sources/ || true
+                            pytest --junit-xml test-reports/results.xml sources/test_calc.py
+                        '''
+                    }
+                    post {
+                        always {
+                            junit 'test-reports/results.xml' 
+                        }
+                    }
                 }
             }
         }
-        stage('Manual Approval') {
-            // Mengecek apakah variabel GIT_BRANCH mengandung kata 'master' pada tipe job Pipeline Standar (bukan Multibranch)
+
+        stage('CD') {
+            // Mengecek apakah variabel GIT_BRANCH mengandung kata 'local-master' pada tipe job Pipeline Standar (bukan Multibranch)
             when { 
-                expression { env.GIT_BRANCH == 'master' || env.GIT_BRANCH == 'origin/master' } 
+                expression { 
+                    env.GIT_BRANCH == env.DEPLOYMENT_BRANCH || 
+                    env.GIT_BRANCH == "origin/${env.DEPLOYMENT_BRANCH}"
+                } 
             }
-            steps {
-                timeout(time: 30, unit: 'MINUTES') {
-                    input message: "Lanjutkan ke tahap Deploy?"
+            stages {
+                stage('Manual Approval') {
+                    agent none
+                    steps {
+                        timeout(time: 30, unit: 'MINUTES') {
+                            input message: "Lanjutkan ke tahap Deploy?"
+                        }
+                    }
                 }
-            }
-        }
-        stage('Deploy') {
-            // This forces Jenkins to exit the global container and execute 
-            // the steps below directly on the host server's terminal shell
-            agent { label 'built-in' } // Use 'master' in older version of Jenkins
-            when { 
-                expression { env.GIT_BRANCH == 'master' || env.GIT_BRANCH == 'origin/master' } 
-            }
-            steps {
-                // Creates a clean workspace on the host node and pulls down the stashed code files
-                deleteDir()
-                unstash 'compiled-results' // Pull the compiled results out of the Jenkins stash
-                sh '''
-                    echo "===> Compile binary secara langsung di host server..."
-                    python3 -m venv venv
-                    . venv/bin/activate
-                    pip install pyinstaller -r requirements.txt --quiet
-                    pyinstaller --onefile sources/add2vals.py
+                stage('Package') {
+                    agent {
+                        docker {
+                            image 'python:3.9-slim-bullseye'
+                            args  '--user root -e HOME=/root'
+                        }
+                    }
+                    steps {
+                        unstash 'compiled-results'
 
-                    echo "===> Copy binary ke direktori /tmp host server..."
-                    cp dist/add2vals /tmp/add2vals
-                    chmod +x /tmp/add2vals
+                        // Debian 11 (Bullseye) reached its official end-of-life (EOL) - Redirect to the Debian Archive Mirrors. 
+                        // Because the release is no longer actively maintained, the Debian security team has moved the package repositories off the main mirrors and archived them. 
+                        // When a container runs apt-get update on Debian 11, it pulls an outdated package index, causing apt-get install to point to a file URL that no longer exists.
+                        sh '''
+                            sed -i 's/deb.debian.org/archive.debian.org/g' /etc/apt/sources.list
+                            sed -i 's/security.debian.org/archive.debian.org/g' /etc/apt/sources.list
+                            sed -i '/debian-security/d' /etc/apt/sources.list
 
-                    echo "===> Memulai aplikasi di background."
-                    # Jalankan binary hasil compile di background dan simpan Process ID (PID)
-                    /tmp/add2vals & APP_PID=$!
+                            apt-get update -qq
+                            apt-get install -y --no-install-recommends binutils
+                            . venv/bin/activate
+                            pip install pyinstaller
+                            pyinstaller --onefile sources/add2vals.py
+                        '''
+                        archiveArtifacts artifacts: 'dist/add2vals', fingerprint: true
+                    }
+                }
+                stage('Deploy') {
+                    // Runs on built-in node (inside jenkins-blueocean)
+                    // Has DOCKER_HOST=tcp://docker:2376 from compose environment,
+                    // so docker network inspect works against the DinD daemon
+                    agent { label 'built-in' }
+                    steps {
+                        script {
+                            // Resolve Gateway
+                            env.DEPLOYMENT_HOST = sh(
+                                script: '''
+                                docker network inspect bridge --format '{{range .IPAM.Config}}{{if .Gateway}}{{.Gateway}}{{end}}{{end}}'
+                                ''',
+                                returnStdout: true
+                            ).trim()
 
-                    echo "===> Menunggu 1 menit aplikasi berjalan."
-                    sleep 60
+                            if (!env.DEPLOYMENT_HOST) {
+                                error "Could not derive gateway from container IP"
+                            }
 
-                    echo "===> Waktu habis. Menghentikan aplikasi."
-                    # Matikan aplikasi menggunakan PID yang disimpan sebelumnya
-                    kill $APP_PID || true
-                    rm -f /tmp/add2vals
-                    echo "===> Deployment telah dihapus."
-                '''
-            }
-            post {
-                success {
-                    archiveArtifacts artifacts: 'dist/add2vals', fingerprint: true
+                            echo "===> Container IP gateway: ${env.DEPLOYMENT_HOST}"
+                        }
+
+                        sshagent(credentials: [env.SSH_CRED_ID]) {
+                            sh '''
+                                echo "===> Copy binary ke direktori /tmp host server..."
+                                scp -v -P ${DEPLOYMENT_PORT} \
+                                    -o StrictHostKeyChecking=no \
+                                    dist/${APP_BINARY_NAME} \
+                                    ${DEPLOYMENT_USER}@${DEPLOYMENT_HOST}:/tmp/${APP_BINARY_NAME}
+                                
+                                echo "===> Jalankan binary lifecycle melalui SSH ke server host..."
+                                ssh -p ${DEPLOYMENT_PORT} \
+                                    -o StrictHostKeyChecking=no \
+                                    ${DEPLOYMENT_USER}@${DEPLOYMENT_HOST} << EOF
+                                        echo "===> Memulai aplikasi di background."
+                                        chmod +x /tmp/${APP_BINARY_NAME}
+                                        /tmp/${APP_BINARY_NAME} & APP_PID=\\$!
+
+                                        echo "===> Aplikasi berjalan (PID: \\$APP_PID). Menunggu 1 menit..."
+                                        sleep 60
+
+                                        echo "===> Waktu habis. Menghentikan aplikasi."
+                                        # Matikan aplikasi menggunakan PID yang disimpan sebelumnya
+                                        kill \\$APP_PID || true
+                                        rm -f /tmp/${APP_BINARY_NAME}
+                                        echo "===> Deployment telah dihapus."
+                            '''
+                        }
+                    }
                 }
             }
         }
@@ -99,7 +164,10 @@ pipeline {
             echo "Pipeline FAILED on ${env.GIT_BRANCH} — ${env.GIT_COMMIT}"
         }
         always {
-            cleanWs() // Clean up the workspace to save disk space on the Jenkins server
+            // cleanWs requires an explicit node context when top-level agent is none
+            node('built-in') {
+                cleanWs() // Clean up the workspace to save disk space on the Jenkins server
+            }
         }
     }
 }
