@@ -33,12 +33,13 @@ pipeline {
         PIP_NO_CACHE_DIR              = '1'
         PIP_DISABLE_PIP_VERSION_CHECK = '1'
 
-        APP_BINARY_NAME   = 'add2vals'
-        DEPLOYMENT_HOST   = getDeploymentHost()
-        DEPLOYMENT_USER   = "${env.DEPLOY_USER}"
-        DEPLOYMENT_PORT   = "${env.DEPLOY_PORT}"
-        DEPLOYMENT_BRANCH = "${env.DEPLOY_BRANCH}"
-        SSH_CRED_ID       = 'host-deploy-key'
+        APP_BINARY_NAME         = 'add2vals'
+        DEPLOYMENT_HOST         = getDeploymentHost()
+        DEPLOYMENT_USER         = "${env.DEPLOY_USER}"
+        DEPLOYMENT_PORT         = "${env.DEPLOY_PORT}"
+        DEPLOYMENT_BRANCH       = "${env.DEPLOY_BRANCH}"
+        DEPLOYMENT_INSTALL_DIR  = "/home/${env.DEPLOY_USER}/.local/bin"
+        SSH_CRED_ID             = 'host-deploy-key'
     }
 
     triggers {
@@ -137,28 +138,56 @@ pipeline {
                     steps {
                         sshagent(credentials: [env.SSH_CRED_ID]) {
                             sh '''
-                                echo "===> Copy binary ke direktori /tmp host server..."
+                                ssh -p ${DEPLOYMENT_PORT} \
+                                    -o StrictHostKeyChecking=no \
+                                    ${DEPLOYMENT_USER}@${DEPLOYMENT_HOST} \
+                                    "mkdir -p ${DEPLOYMENT_INSTALL_DIR}"
+
+                                echo "===> Uploading binary..."
                                 scp -P ${DEPLOYMENT_PORT} \
                                     -o StrictHostKeyChecking=no \
                                     dist/${APP_BINARY_NAME} \
-                                    ${DEPLOYMENT_USER}@${DEPLOYMENT_HOST}:/tmp/${APP_BINARY_NAME}
+                                    ${DEPLOYMENT_USER}@${DEPLOYMENT_HOST}:${DEPLOYMENT_INSTALL_DIR}/${APP_BINARY_NAME}
                                 
-                                echo "===> Jalankan binary lifecycle melalui SSH ke server host..."
+                                # Deploy, run, wait, then clean up — all in one remote session
+                                # Single session ensures APP_PID is still in scope during cleanup
+                                echo "===> Run app lifecycle in a single session..."
                                 ssh -p ${DEPLOYMENT_PORT} \
                                     -o StrictHostKeyChecking=no \
                                     ${DEPLOYMENT_USER}@${DEPLOYMENT_HOST} << EOF
-                                        echo "===> Memulai aplikasi di background."
-                                        chmod +x /tmp/${APP_BINARY_NAME}
-                                        /tmp/${APP_BINARY_NAME} & APP_PID=\\$!
+                                        APP_BINARY="${DEPLOYMENT_INSTALL_DIR}/${APP_BINARY_NAME}"
+                
+                                        echo "===> Installing binary..."
+                                        chmod +x "\\${APP_BINARY}"
 
-                                        echo "===> Aplikasi berjalan (PID: \\$APP_PID). Menunggu 1 menit..."
+                                        echo "===> Verifying binary is accessible from PATH..."
+                                        which "${APP_BINARY_NAME}" && echo "PATH check OK: \\$(which ${APP_BINARY_NAME})"
+
+                                        echo "===> Running in background..."
+                                        "\\${APP_BINARY}" & APP_PID=\\$! 
+                                        echo "App started — PID: \\${APP_PID}"
+
+                                        echo "===> Testing app..."
+                                        echo "9 + 8 = \\$(\\${APP_BINARY} 9 8)"                                        
+                                        echo "19 + 81 = \\$(\\${APP_BINARY} 19 81)"
+                                        echo "919 + 181 = \\$(\\${APP_BINARY} 919 181)"
+
+                                        echo "===> Waiting 60s..."
                                         sleep 60
 
-                                        echo "===> Waktu habis. Menghentikan aplikasi."
-                                        # Matikan aplikasi menggunakan PID yang disimpan sebelumnya
-                                        kill \\$APP_PID || true
-                                        rm -f /tmp/${APP_BINARY_NAME}
-                                        echo "===> Deployment telah dihapus."
+                                        echo "===> Stopping app..."
+                                        if kill -0 \\${APP_PID} 2>/dev/null; then
+                                            kill \\${APP_PID}
+                                            wait \\${APP_PID} 2>/dev/null || true
+                                            echo "App stopped cleanly"
+                                        else
+                                            echo "App already exited"
+                                        fi
+
+                                        echo "===> Removing binary..."
+                                        rm -f "\\${APP_BINARY}"
+
+                                        echo "===> Cleanup complete"
                             '''
                         }
                     }
