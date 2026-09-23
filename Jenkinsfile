@@ -4,7 +4,6 @@ def getDeploymentHost() {
 
     // Conditionally intercept and perform the dynamic gateway calculation
     if (targetHost == 'localhost' || targetHost == '127.0.0.1') {
-        echo "🔍 Host detected as localhost. Dynamically resolving Docker network gateway..."
         
         def resolvedIp = sh(
             script: "docker network inspect bridge --format '{{range .IPAM.Config}}{{if .Gateway}}{{.Gateway}}{{end}}{{end}}'",
